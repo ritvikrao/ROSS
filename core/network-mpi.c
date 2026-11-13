@@ -32,6 +32,62 @@ static struct act_q posted_sends;
 static struct act_q posted_recvs;
 static tw_eventq outq;
 
+#ifdef AVL_TREE
+#include "avl_tree.h"
+/*
+ * Anti-messages that arrived before the positive event they cancel.
+ *
+ * Every event goes out with the same tag on the same communicator, so MPI
+ * *matches* a cancellation after the positive event it follows.  But the
+ * receives are serviced with MPI_Testsome, and MPI orders neither request
+ * completion nor the indices Testsome returns: the receive holding the
+ * anti-message can be reported before the receive holding the positive event.
+ * Without this list, recv_finish() then looks the event up in the AVL tree,
+ * does not find it, and aborts with "We never look for non-existent events!".
+ *
+ * The positive event is still in flight (sent, not yet received), so the GVT
+ * white-message count cannot reach zero until it arrives; this list is
+ * therefore always empty when GVT is computed (checked in tw_net_minimum*).
+ */
+static tw_eventq early_cancels;
+static unsigned long long n_early_cancels = 0;
+
+static int
+same_remote_event(tw_event const *a, tw_event const *b)
+{
+  return a->event_id == b->event_id
+      && a->send_pe == b->send_pe
+      && a->dest_lp == b->dest_lp
+      && TW_STIME_CMP(a->recv_ts, b->recv_ts) == 0
+#ifdef USE_RAND_TIEBREAKER
+      && a->sig.event_tiebreaker[0] == b->sig.event_tiebreaker[0]
+#endif
+      ;
+}
+
+/* If the anti-message for positive event e already arrived, unlink it and return it. */
+static tw_event *
+take_early_cancel(tw_event const *e)
+{
+  tw_event *c;
+  for (c = early_cancels.head; c; c = c->next) {
+    if (same_remote_event(c, e)) {
+      tw_eventq_delete_any(&early_cancels, c);
+      return c;
+    }
+  }
+  return NULL;
+}
+
+static void
+check_no_early_cancels(void)
+{
+  if (early_cancels.size)
+    tw_error(TW_LOC, "%u anti-message(s) still waiting for their positive event at GVT",
+             early_cancels.size);
+}
+#endif
+
 static unsigned int read_buffer = 16;   /**< Number of Irecv's to buffer, length of posted_recvs queue */
 static unsigned int send_buffer = 1024; /**< Number of Isend's to buffer, length of posted_sends queue */
 static int world_size = 1;
@@ -185,6 +241,9 @@ tw_net_minimum(void)
   tw_event *e;
   unsigned int i;
 
+#ifdef AVL_TREE
+  check_no_early_cancels();
+#endif
   e = outq.head;
   while (e) {
     if (TW_STIME_CMP(m, e->recv_ts) > 0)
@@ -208,6 +267,10 @@ tw_net_minimum_sig_ptr(void)
     tw_event_sig const * m = &g_tw_max_sig;
     tw_event *e;
     unsigned int i;
+
+#ifdef AVL_TREE
+    check_no_early_cancels();
+#endif
 
     e = outq.head;
     while (e) {
@@ -401,6 +464,15 @@ recv_finish(tw_pe *me, tw_event *e, char * buffer)
   // else, store in hash table
   if(e->state.cancel_q)
     {
+#ifdef AVL_TREE
+      if (!avlSearch(e->dest_lp->kp->avl_tree, e)) {
+        /* The positive event has not been received yet: hold the
+         * anti-message until it is (see early_cancels above). */
+        n_early_cancels++;
+        tw_eventq_push(&early_cancels, e);
+        return;
+      }
+#endif
       tw_event *cancel = tw_hash_remove(me->hash_t, e, e->send_pe);
 
       // NOTE: it is possible to cancel the event we
@@ -418,6 +490,18 @@ recv_finish(tw_pe *me, tw_event *e, char * buffer)
 
       return;
     }
+
+#ifdef AVL_TREE
+  if (early_cancels.size) {
+    tw_event *c = take_early_cancel(e);
+    if (c) {
+      /* Its anti-message already arrived: annihilate both. */
+      tw_event_free(me, c);
+      tw_event_free(me, e);
+      return;
+    }
+  }
+#endif
 
   if (g_tw_synchronization_protocol == OPTIMISTIC ||
       g_tw_synchronization_protocol == OPTIMISTIC_DEBUG ||
@@ -696,6 +780,16 @@ tw_net_cancel(tw_event *e)
 tw_statistics	*
 tw_net_statistics(tw_pe * me, tw_statistics * s)
 {
+#ifdef AVL_TREE
+  {
+    unsigned long long total_early = 0;
+    if (MPI_Reduce(&n_early_cancels, &total_early, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM,
+                   (int)g_tw_masternode, MPI_COMM_ROSS) != MPI_SUCCESS)
+      tw_error(TW_LOC, "Unable to reduce statistics!");
+    if (g_tw_mynode == g_tw_masternode)
+      printf("\tAnti-messages received before their event (held)   %llu\n", total_early);
+  }
+#endif
   if(MPI_Reduce(&(s->s_max_run_time),
 		&me->stats.s_max_run_time,
 		1,
